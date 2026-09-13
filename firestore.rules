@@ -1,0 +1,219 @@
+rules_version = '2';
+
+// Rules ini hanya CONTOH AWAL — sesuaikan lagi kalau nanti nama
+// collection/field-nya berubah. Tempel isi file ini ke:
+// Firebase Console > Firestore Database > Rules
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper: ambil role user yang sedang login dari dokumen users/{uid}
+    function getRole() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && getRole() == 'admin';
+    }
+
+    function isDokter() {
+      return isSignedIn() && getRole() == 'dokter';
+    }
+
+    function isPasien() {
+      return isSignedIn() && getRole() == 'pasien';
+    }
+
+    // NIK milik user yang lagi login (kalau dia pasien). Dipakai buat cek
+    // kepemilikan medicalRecords/resep yang di-index by pasienNik, BUKAN uid.
+    function myNik() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.nik;
+    }
+
+    // ---- users ----
+    // Pasien boleh daftar sendiri (create), TAPI role yang boleh mereka
+    // set sendiri cuma 'pasien' - supaya orang nggak bisa akal-akalan
+    // daftar sebagai 'dokter'/'admin' dari form publik.
+    // Admin boleh create/update/delete dokumen SIAPA SAJA (dipakai saat
+    // admin bikin akun dokter dari panel admin).
+    match /users/{userId} {
+      allow read: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+      allow create: if isSignedIn() && (
+        (request.auth.uid == userId && request.resource.data.role == 'pasien') || isAdmin()
+      );
+
+      // Update: SEBELUMNYA "isSignedIn() && uid == userId" saja, tanpa batas
+      // field - itu berarti user mana pun bisa updateDoc() dokumennya sendiri
+      // dan mengubah field `role` jadi 'admin' langsung dari client (lewat
+      // devtools/panggilan Firestore manual, bukan lewat UI resmi - rules
+      // berlaku di server, jadi UI yang "tidak punya tombolnya" tidak
+      // melindungi apa-apa). Sekarang dikunci: user biasa CUMA boleh ubah
+      // `nama` miliknya sendiri - `role`, `email`, `nik` tidak bisa diubah
+      // lewat jalur ini sama sekali (email ganti lewat Firebase Auth, role/
+      // nik cuma admin).
+      allow update: if isAdmin()
+        || (isSignedIn()
+            && request.auth.uid == userId
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['nama']));
+
+      allow delete: if isAdmin() || (isSignedIn() && request.auth.uid == userId);
+    }
+
+    // ---- rekam medis ----
+    // Di-index by pasienNik (bukan uid) - konsisten dengan pasienProfile,
+    // supaya pasien walk-in (belum punya akun) tetap bisa diperiksa & dicatat.
+    match /medicalRecords/{recordId} {
+      // Read dibatasi ketat: admin bebas, dokter cuma punya rekam medis yang
+      // dia buat sendiri, pasien cuma punya rekam medis dengan NIK dirinya.
+      // JANGAN diganti jadi isSignedIn() saja - itu bikin semua pasien bisa
+      // saling intip rekam medis orang lain.
+      allow read: if isAdmin()
+        || (isDokter() && resource.data.dokterUid == request.auth.uid)
+        || (isPasien() && resource.data.pasienNik == myNik());
+
+      // Create: dokterUid di data yang baru ditulis WAJIB sama dengan dokter
+      // yang sedang login - supaya dokter A tidak bisa bikin rekam medis
+      // atas nama dokter B.
+      allow create: if isAdmin()
+        || (isDokter() && request.resource.data.dokterUid == request.auth.uid);
+
+      // Update: admin bebas ubah apa saja (termasuk soft-delete lewat
+      // field deletedAt/deletedBy/deleteReason - lihat admin/rekam_medis.tsx).
+      // Dokter cuma boleh ubah rekam medis MILIKNYA SENDIRI, dan HANYA
+      // field isi klinis (keluhan/diagnosa/tindakan/catatan/updatedAt) -
+      // TIDAK boleh ubah dokterUid atau pasienNik (supaya tidak bisa
+      // "memindahkan" record ke dokter/pasien lain), dan TIDAK boleh
+      // sentuh field soft-delete (itu jalur khusus admin, bukan dokter).
+      allow update: if isAdmin()
+        || (isDokter()
+            && resource.data.dokterUid == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['keluhan', 'diagnosa', 'tindakan', 'catatan', 'updatedAt']));
+
+      allow delete: if isAdmin();
+    }
+
+    // ---- data master (poli, obat) ----
+    // Semua user login boleh baca (perlu ditampilkan di form),
+    // hanya admin yang boleh ubah.
+    match /poli/{poliId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    match /obat/{obatId} {
+      allow read: if isSignedIn();
+      allow create, delete: if isAdmin();
+      // Dokter boleh update HANYA field `stok` (dipakai saat bikin resep,
+      // stok otomatis dikurangi lewat transaction - lihat dokter/resep.tsx).
+      // Field lain (nama, harga, dst) tetap cuma admin yang boleh ubah.
+      allow update: if isAdmin()
+        || (isDokter() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['stok']));
+    }
+
+    // ---- profil khusus dokter (spesialisasi, poli tempat praktik) ----
+    // Semua user login boleh baca (pasien perlu lihat spesialisasi & poli
+    // dokter saat memilih dokter). Cuma admin yang boleh menulis - karena
+    // proses "admin bikin akun dokter" tetap terautentikasi sebagai admin
+    // di mata Firestore (bukan sebagai dokter yang baru dibuat).
+    match /dokterProfile/{uid} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // ---- profil khusus pasien (NIK, alamat, alergi, dll) ----
+    // Di-index BY NIK (bukan uid) - lihat penjelasan lengkap di types/pasien.ts.
+    // Alur singkatnya: admin bisa input data medis walk-in duluan (uid: null),
+    // lalu pasien "klaim" data itu saat register dengan mengisi field uid.
+    match /pasienProfile/{nik} {
+      // Baca: admin & dokter bebas (perlu lihat data medis pasien yg
+      // ditangani). Pasien cuma boleh baca NIK yang SUDAH ditautkan ke
+      // uid-nya sendiri.
+      allow read: if isAdmin() || isDokter() || (isPasien() && resource.data.uid == request.auth.uid);
+
+      // Create: admin boleh bikin data walk-in kapan saja (uid: null atau
+      // langsung terisi). Pasien cuma boleh create dokumen BARU (NIK yang
+      // belum pernah ada) untuk dirinya sendiri, uid wajib = uid dia sendiri.
+      allow create: if isAdmin()
+        || (isPasien()
+            && request.resource.data.uid == request.auth.uid
+            && request.resource.data.nik == nik);
+
+      // Update: admin bebas ubah apa saja (lengkapi data medis, dst).
+      // Pasien HANYA boleh "klaim" dokumen yang uid-nya masih kosong
+      // (null), dan HANYA boleh mengubah field uid/email/updatedAt - tidak
+      // boleh mengubah data medis (nama, alamat, alergi, dll) yang sudah
+      // diinput admin. Ini mencegah pasien mengarang ulang rekam medisnya
+      // sendiri lewat proses klaim.
+      // CATATAN PENTING soal NIK baru (dokumen belum ada):
+      // Kalau dokumennya belum ada, `resource` bernilai null, jadi
+      // `resource.data.uid` TIDAK BOLEH diakses langsung - itu akan
+      // membuat evaluasi rule error, dan Firestore memperlakukan error
+      // evaluasi sebagai DITOLAK (permission-denied), bukan not-found.
+      // Akibatnya register.tsx (yang mengandalkan kode error 'not-found'
+      // vs 'permission-denied' untuk membedakan "NIK baru" vs "NIK sudah
+      // diklaim orang lain") akan salah baca semua NIK baru sebagai
+      // "sudah diklaim". Makanya di sini kita cek exists() dulu: kalau
+      // dokumen belum ada, kita IZINKAN saja rule-nya lolos - nanti
+      // Firestore sendiri yang menolak update() itu di level backend
+      // dengan kode not-found (karena update pada dokumen yang benar-benar
+      // tidak ada memang selalu gagal begitu, di luar security rules).
+      allow update: if isAdmin()
+        || (isPasien()
+            && request.resource.data.uid == request.auth.uid
+            && (
+              !exists(/databases/$(database)/documents/pasienProfile/$(nik))
+              || (
+                resource.data.uid == null
+                && request.resource.data.diff(resource.data).affectedKeys()
+                     .hasOnly(['uid', 'email', 'updatedAt'])
+              )
+            ));
+
+      allow delete: if isAdmin();
+    }
+
+    // ---- resep ----
+    // Sama pola dengan medicalRecords, di-index terkait pasienNik/dokterUid.
+    match /resep/{resepId} {
+      allow read: if isAdmin()
+        || (isDokter() && resource.data.dokterUid == request.auth.uid)
+        || (isPasien() && resource.data.pasienNik == myNik());
+
+      allow create: if isAdmin()
+        || (isDokter() && request.resource.data.dokterUid == request.auth.uid);
+
+      // Sama alasannya dengan medicalRecords di atas: dokter cuma boleh
+      // ubah resep miliknya sendiri, dan tidak boleh pindah kepemilikan
+      // (dokterUid/pasienNik/medicalRecordId dikunci, cuma isi resep &
+      // catatan yang boleh diubah).
+      allow update: if isAdmin()
+        || (isDokter()
+            && resource.data.dokterUid == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['items', 'catatan']));
+
+      allow delete: if isAdmin();
+    }
+
+    // ---- pengaturan aplikasi (singleton) ----
+    // Dokumen tunggal settings/app, isinya pengaturan global klinik (mis.
+    // stokMenipisThreshold - lihat admin/pengaturan.tsx & admin/laporan.tsx).
+    // Read dibuka untuk semua yang login (bukan cuma admin) karena nilainya
+    // tidak sensitif dan kemungkinan dipakai lagi oleh halaman lain (dokter
+    // mungkin nanti perlu tahu ambang batas ini juga). Write cuma admin.
+    match /settings/{settingId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // Default: tolak semua yang tidak match rule di atas
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
